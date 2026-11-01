@@ -21,6 +21,17 @@ from logger import LOGGER
 logger = LOGGER(__name__)
 SUBSCRIPTION = os.environ.get('SUBSCRIPTION', 'https://graph.org/file/242b7f1b52743938d81f1.jpg')
 FREE_LIMIT_SIZE = 2 * 1024 * 1024 * 1024
+
+# Telegram bots can only UPLOAD files up to 2 GB (2000 MiB). A Premium account
+# gets 4000 MiB. Anything bigger is split into parts.
+BOT_UPLOAD_LIMIT = 2000 * 1024 * 1024
+ACCOUNT_UPLOAD_LIMIT_PREMIUM = 4000 * 1024 * 1024
+# Keep every part safely under the 2 GB ceiling.
+SPLIT_TARGET = 1900 * 1024 * 1024
+# Read/write in small chunks so RAM stays low (Render free has only 512 MB).
+SPLIT_CHUNK = 8 * 1024 * 1024
+# These extensions get a PLAYABLE ffmpeg split instead of a byte split.
+VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".m4v", ".flv", ".ts", ".mpg", ".mpeg", ".3gp"}
 FREE_LIMIT_DAILY = 10
 UPI_ID = os.environ.get("UPI_ID", "20213904@axl")
 QR_CODE = os.environ.get("QR_CODE", "https://raw.githubusercontent.com/R0Y4L-KING/save-restricted-bot/main/assets/upi_qr.png")
@@ -50,6 +61,23 @@ if (
 ):
     raise Exception("Tampered developer info detected! Bot will not start.")
 
+
+class _UserShim:
+    """Minimal stand-in so verify helpers can read a user id from a callback."""
+    def __init__(self, user_id):
+        self.id = user_id
+
+
+class _MsgShim:
+    """Wraps a bot message but reports the CLICKING user as from_user."""
+    def __init__(self, msg, user_id):
+        self._msg = msg
+        self.from_user = _UserShim(user_id)
+
+    def __getattr__(self, item):
+        return getattr(self._msg, item)
+
+
 class script(object):
    
     START_TXT = """<b>👋 Hello {},</b>
@@ -69,26 +97,50 @@ Use <code>/batch</code> and send a range link.
 <b>4️⃣ Free users:</b> verify once and get full access for 6 hours.</blockquote>
 <b>👇 Select an Option Below to Get Started:</b>
 """
-    HELP_TXT = """<b>📚 Comprehensive Help & User Guide</b>
-<blockquote><b>1️⃣ Public Channels (No Login Required)</b></blockquote>
-• Forward or send the post link directly.
-• Compatible with any public channel or group.
-• <i>Example Link:</i> <code>https://t.me/channel/123</code>
-<blockquote><b>2️⃣ Private/Restricted Channels (Login Required)</b></blockquote>
-• Use <code>/login</code> to securely connect your Telegram account.
-• Send the private link (e.g., <code>t.me/c/123...</code>).
-• Bot accesses content using your authenticated session.
-<blockquote><b>3️⃣ Batch Downloading Mode</b></blockquote>
-• Use <code>/batch</code>, or just send the link directly.
-• Send a range link, e.g. <code>https://t.me/channel/100-110</code>.
-• The bot saves every message in that ID range.
-<blockquote><b>🛑 Free User Limitations:</b></blockquote>
-• <b>Daily Quota:</b> 10 Files / 24 Hours
-• <b>File Size Cap:</b> 2GB Maximum
-<blockquote><b>💎 Premium Membership Benefits:</b></blockquote>
-• Unlimited Downloads & No Restrictions.
-• Priority Support & Advanced Features.
-"""
+    HELP_TXT = """<b>📚 Help & User Guide</b>
+<i>Everything you need, in one place.</i>
+
+<blockquote><b>1️⃣ Save a single post</b></blockquote>
+Just send me the post link 👇
+<code>https://t.me/channel/123</code>
+
+<blockquote><b>2️⃣ Private / restricted channel</b></blockquote>
+• Do <code>/login</code> first
+• Send the OTP <b>with spaces</b> → <code>1 2 3 4 5</code>
+• Then send the private link 👇
+<code>https://t.me/c/123456789/45</code>
+<i>⚠️ The account you log in with must be a member of that channel.</i>
+
+<blockquote><b>3️⃣ Batch mode — many files at once</b></blockquote>
+• Send <code>/batch</code>
+• I'll ask for the <b>start link</b> → send it
+• Then I'll ask <b>how many messages</b> → send a number (1–100)
+• I save every post from there onwards ✅
+
+<i>Or send a range link directly:</i>
+<code>https://t.me/channel/100-110</code>
+
+<blockquote><b>🛑 Free plan limits</b></blockquote>
+• <b>Daily saves:</b> 10 files / 24 hours
+• <b>File size:</b> up to 2 GB
+• <b>Verification:</b> only after your 10 free saves are used up
+
+<blockquote><b>💎 Premium benefits</b></blockquote>
+• ♾️ Unlimited daily saves
+• 🚀 No verification / ads
+• 📂 Larger file sizes
+• 🖼 Custom thumbnail & caption
+• ⚡ Priority speed
+
+<blockquote><b>⚙️ Personalise your saves</b></blockquote>
+• <code>/set_thumb</code> — custom thumbnail
+• <code>/set_caption</code> — custom caption
+• <code>/set_del_word</code> — remove words from captions
+• <code>/set_repl_word</code> — replace words in captions
+• <code>/myplan</code> — check your plan
+• <code>/cancel</code> — stop a running task
+
+<i>Need help? Contact @SANATANI_B0Y</i>"""
     ABOUT_TXT = """<b>ℹ️ About This Bot</b>
 <blockquote><b>╭────[ 🧩 Technical Stack ]────⍟</b>
 <b>├⍟ 🤖 Bot Name : <a href=https://t.me/{bot_username}>{bot_name}</a></b>
@@ -308,7 +360,8 @@ async def send_help(client: Client, message: Message):
         chat_id=message.chat.id,
         text=script.HELP_TXT,
         reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode=enums.ParseMode.HTML
+        parse_mode=enums.ParseMode.HTML,
+        disable_web_page_preview=True
     )
 @Client.on_message(filters.command(["plan", "premium"]))
 async def send_plan(client: Client, message: Message):
@@ -442,22 +495,16 @@ async def handle_batch_input(client: Client, message: Message):
 
 async def process_save_link(client: Client, message: Message, text: str, count: int = None):
     if "https://t.me/" in text:
-        # Ad-verification gate: free users must complete the shortener first
         from cantarella.verify import is_user_verified, send_verify_prompt
+
+        # Premium and already-verified users go straight through.
+        # Everyone else gets their 10 daily saves FIRST - verification is only
+        # asked for once that free quota is used up.
         if not await is_user_verified(message.from_user.id):
-            await send_verify_prompt(client, message, text, count)
-            return
-       
-        is_limit_reached = await db.check_limit(message.from_user.id)
-        if is_limit_reached:
-            btn = InlineKeyboardMarkup([[InlineKeyboardButton("💎 Upgrade to Premium", callback_data="buy_premium")]])
-            return await message.reply_photo(
-                photo=SUBSCRIPTION,
-                caption=script.LIMIT_REACHED,
-                reply_markup=btn,
-                parse_mode=enums.ParseMode.HTML
-            )
-       
+            if await db.check_limit(message.from_user.id):
+                await send_verify_prompt(client, message, text, count)
+                return
+
         if batch_temp.IS_BATCH.get(message.from_user.id) == False:
             return await message.reply_text("<b>⚠️ A Task is Currently Processing.</b>\n<i>Please wait for completion or use /cancel to stop.</i>", parse_mode=enums.ParseMode.HTML)
         datas = text.split("/")
@@ -480,6 +527,23 @@ async def process_save_link(client: Client, message: Message, text: str, count: 
            
             if batch_temp.IS_BATCH.get(message.from_user.id):
                 break
+
+            # Enforce the daily quota per file - otherwise a batch would skip it.
+            if not await is_user_verified(message.from_user.id):
+                if await db.check_limit(message.from_user.id):
+                    batch_temp.IS_BATCH[message.from_user.id] = True
+                    btn = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔓 Verify Now", callback_data="verify_now")],
+                        [InlineKeyboardButton("💎 Get Premium", callback_data="buy_premium")]
+                    ])
+                    await message.reply(
+                        "<b>🚫 Daily limit reached</b>\n\n"
+                        "<blockquote>You've used your <b>10 free saves</b> for today.\n\n"
+                        "Tap <b>🔓 Verify Now</b> for 6 hours of unlimited access.</blockquote>",
+                        reply_markup=btn,
+                        parse_mode=enums.ParseMode.HTML
+                    )
+                    return
            
             if is_public_link:
                 username = datas[3]
@@ -515,6 +579,12 @@ async def process_save_link(client: Client, message: Message, text: str, count: 
                     max_concurrent_transmissions=10
                 )
                 await acc.connect()
+                # Pyrogram only assigns self.me inside start(), but save_file()
+                # reads me.is_premium for the upload limit - so set it here.
+                try:
+                    acc.me = await acc.get_me()
+                except Exception:
+                    pass
             except Exception as e:
                 batch_temp.IS_BATCH[message.from_user.id] = True
                 return await message.reply(f"<b>❌ Authentication Failed</b>\n\n<i>Your session may have expired. Please /logout and /login again.</i>\n<code>{e}</code>", parse_mode=enums.ParseMode.HTML)
@@ -537,17 +607,133 @@ async def process_save_link(client: Client, message: Message, text: str, count: 
                 "<i>Powered by @ModAppsKing</i>",
                 parse_mode=enums.ParseMode.HTML
             )
+
+
+def _ffmpeg_exe():
+    """Return an ffmpeg binary path (pip package first, then PATH)."""
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        pass
+    return shutil.which("ffmpeg")
+
+
+async def split_video(file_path, out_dir):
+    """Split a video into PLAYABLE parts without re-encoding (-c copy)."""
+    ff = _ffmpeg_exe()
+    if not ff:
+        logger.warning("ffmpeg not found - falling back to a byte split")
+        return []
+    ext = os.path.splitext(file_path)[1] or ".mp4"
+    pattern = os.path.join(out_dir, f"part_%03d{ext}")
+    cmd = [
+        ff, "-y", "-i", file_path,
+        "-c", "copy", "-map", "0",
+        "-f", "segment", "-segment_size", str(SPLIT_TARGET),
+        "-reset_timestamps", "1",
+        pattern,
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await proc.communicate()
+        if proc.returncode != 0:
+            logger.error(f"ffmpeg split failed: {err.decode(errors='ignore')[-400:]}")
+            return []
+    except Exception as e:
+        logger.error(f"ffmpeg split error: {e}")
+        return []
+    parts = sorted(
+        os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.startswith("part_")
+    )
+    return parts if len(parts) > 1 else []
+
+
+def split_binary(file_path, out_dir):
+    """Byte-split a file into .001/.002 parts using a SMALL memory footprint.
+
+    Never read the whole part into RAM - that is what crashed the 512 MB
+    Render instance. We stream it in SPLIT_CHUNK (8 MB) pieces.
+    """
+    base = os.path.basename(file_path)
+    parts = []
+    try:
+        with open(file_path, "rb") as src:
+            idx = 1
+            while True:
+                part = os.path.join(out_dir, f"{base}.{idx:03d}")
+                written = 0
+                with open(part, "wb") as out:
+                    while written < SPLIT_TARGET:
+                        buf = src.read(min(SPLIT_CHUNK, SPLIT_TARGET - written))
+                        if not buf:
+                            break
+                        out.write(buf)
+                        written += len(buf)
+                if written == 0:
+                    os.remove(part)
+                    break
+                parts.append(part)
+                idx += 1
+    except Exception as e:
+        logger.error(f"Byte split failed: {e}")
+    return parts if len(parts) > 1 else []
+
+
 async def handle_restricted_content(client: Client, acc, message: Message, chat_target, msgid):
     try:
         msg: Message = await acc.get_messages(chat_target, msgid)
     except Exception as e:
         logger.error(f"Error fetching message: {e}")
+        err = str(e)
+        if "CHANNEL_INVALID" in err or "CHANNEL_PRIVATE" in err:
+            await message.reply(
+                "<b>❌ No access to that channel.</b>\n\n"
+                "<blockquote>The account you logged in with is <b>not a member</b> of "
+                "that channel (or the channel was deleted).\n\n"
+                "Join it with that account, then send the link again.</blockquote>",
+                parse_mode=enums.ParseMode.HTML
+            )
+        elif "AUTH_KEY_UNREGISTERED" in err or "SESSION_REVOKED" in err or "USER_DEACTIVATED" in err:
+            try:
+                await db.set_session(message.from_user.id, session=None)
+            except Exception:
+                pass
+            await message.reply(
+                "<b>⚠️ Your login expired.</b>\n\n"
+                "<i>Please send /login again to reconnect your account.</i>",
+                parse_mode=enums.ParseMode.HTML
+            )
+        else:
+            await message.reply(
+                "<b>❌ Could not open that post.</b>\n\n"
+                "<blockquote>• Please do <code>/login</code> first — I use <b>your</b> "
+                "account to read restricted posts.\n"
+                "• The account you logged in with must be a <b>member of that channel</b>.\n"
+                "• Check that the link is correct and the post still exists.</blockquote>\n"
+                f"<code>{e}</code>",
+                parse_mode=enums.ParseMode.HTML
+            )
         return
     if msg.empty:
+        await message.reply(
+            "<b>❌ That post was not found.</b>\n\n"
+            "<i>It may have been deleted, or the link is wrong.</i>",
+            parse_mode=enums.ParseMode.HTML
+        )
         return
    
     msg_type = get_message_type(msg)
     if not msg_type:
+        await message.reply(
+            "<b>❌ Nothing to save in that post.</b>\n\n"
+            "<i>I can save videos, documents, audio and photos.</i>",
+            parse_mode=enums.ParseMode.HTML
+        )
         return
     file_size = 0
     if msg_type == "Document": file_size = msg.document.file_size
@@ -591,6 +777,7 @@ async def handle_restricted_content(client: Client, acc, message: Message, chat_
             if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
             return await smsg.edit("❌ **Task Cancelled**")
         return await smsg.delete()
+    upload_ok = True
     try:
         asyncio.create_task(upstatus(client, f'{message.id}upstatus.txt', smsg, message.chat.id))
        
@@ -617,20 +804,94 @@ async def handle_restricted_content(client: Client, acc, message: Message, chat_
             final_caption = script.CAPTION.format(file_name=file.split("/")[-1])
             if msg.caption:
                 final_caption += f"\n\n{msg.caption}"
-        if msg_type == "Document":
-            await client.send_document(message.chat.id, file, thumb=ph_path, caption=final_caption, progress=progress, progress_args=[message, "up"])
-        elif msg_type == "Video":
-            await client.send_video(message.chat.id, file, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=ph_path, caption=final_caption, progress=progress, progress_args=[message, "up"])
-        elif msg_type == "Audio":
-            await client.send_audio(message.chat.id, file, thumb=ph_path, caption=final_caption, progress=progress, progress_args=[message, "up"])
-        elif msg_type == "Photo":
-            await client.send_photo(message.chat.id, file, caption=final_caption)
-       
+
+        # Apply the user's /set_del_word and /set_repl_word rules
+        try:
+            for w in (await db.get_delete_words(message.from_user.id)) or []:
+                if w:
+                    final_caption = final_caption.replace(w, "")
+            for old, new in ((await db.get_replace_words(message.from_user.id)) or {}).items():
+                if old:
+                    final_caption = final_caption.replace(old, new or "")
+            final_caption = final_caption.strip()
+        except Exception as e:
+            logger.error(f"Failed to apply word rules: {e}")
+
+        # ---- Decide how to deliver it --------------------------------------
+        acct_premium = bool(getattr(getattr(acc, "me", None), "is_premium", False))
+        acct_limit = ACCOUNT_UPLOAD_LIMIT_PREMIUM if acct_premium else BOT_UPLOAD_LIMIT
+        size = file_size or 0
+        # A .mkv/.mp4 often arrives as a Document - still treat it as a video
+        # so the parts come out playable instead of a raw byte split.
+        ext = os.path.splitext(file)[1].lower()
+        is_video = (msg_type == "Video") or (ext in VIDEO_EXTS)
+
+        if size <= BOT_UPLOAD_LIMIT:
+            uploader = client
+            parts = [file]
+        elif size <= acct_limit:
+            uploader = acc
+            parts = [file]
+        else:
+            # Bigger than Telegram allows on this account -> split into parts.
+            # Everything heavy runs off the event loop so the bot stays alive.
+            parts = []
+            if is_video:
+                try:
+                    await smsg.edit("<b>✂️ Splitting the video into playable parts…</b>", parse_mode=enums.ParseMode.HTML)
+                except Exception:
+                    pass
+                parts = await split_video(file, temp_dir)
+            if len(parts) < 2:
+                try:
+                    await smsg.edit("<b>✂️ Splitting the file into parts…</b>", parse_mode=enums.ParseMode.HTML)
+                except Exception:
+                    pass
+                parts = await asyncio.to_thread(split_binary, file, temp_dir)
+            if len(parts) < 2:
+                raise ValueError(
+                    "This file is too big for Telegram and could not be split "
+                    "(not enough disk space)."
+                )
+            uploader = client   # every part is under 2 GB, so the bot can send it
+
+        total_parts = len(parts)
+        for idx, part in enumerate(parts, start=1):
+            cap = final_caption
+            if total_parts > 1:
+                cap += f"\n\n<b>📦 Part {idx}/{total_parts}</b>"
+            thumb = ph_path if idx == 1 else None
+            if total_parts > 1:
+                await uploader.send_document(message.chat.id, part, thumb=thumb, caption=cap, progress=progress, progress_args=[message, "up"])
+            elif msg_type == "Document":
+                await uploader.send_document(message.chat.id, part, thumb=thumb, caption=cap, progress=progress, progress_args=[message, "up"])
+            elif msg_type == "Video":
+                await uploader.send_video(message.chat.id, part, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=thumb, caption=cap, progress=progress, progress_args=[message, "up"])
+            elif msg_type == "Audio":
+                await uploader.send_audio(message.chat.id, part, thumb=thumb, caption=cap, progress=progress, progress_args=[message, "up"])
+            elif msg_type == "Photo":
+                await uploader.send_photo(message.chat.id, part, caption=cap)
+
+        upload_ok = True
     except Exception as e:
-         await smsg.edit(f"Upload Failed: {e}")
+        upload_ok = False
+        logger.error(f"Upload failed: {e}")
+        hint = ""
+        if file_size and file_size > BOT_UPLOAD_LIMIT:
+            hint = ("\n\n<i>This file is over 2 GB. Telegram only lets a Premium "
+                    "account upload that much - try /login with a Premium account.</i>")
+        try:
+            await smsg.edit(
+                f"<b>❌ Upload Failed</b>\n\n<code>{e}</code>{hint}",
+                parse_mode=enums.ParseMode.HTML
+            )
+        except Exception:
+            pass
     if os.path.exists(f'{message.id}upstatus.txt'): os.remove(f'{message.id}upstatus.txt')
     if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
-    await client.delete_messages(message.chat.id, [smsg.id])
+    # Keep the message on screen when it failed, so the user (and you) can see why.
+    if upload_ok:
+        await client.delete_messages(message.chat.id, [smsg.id])
 @Client.on_callback_query()
 async def button_callbacks(client: Client, callback_query: CallbackQuery):
     data = callback_query.data
@@ -657,6 +918,15 @@ async def button_callbacks(client: Client, callback_query: CallbackQuery):
         )
     elif data == "settings_btn":
         await settings_panel(client, callback_query)
+    elif data == "verify_now":
+        # Real verification flow (the clicking user, not the bot, is the owner)
+        from cantarella.verify import is_user_verified, send_verify_prompt
+        uid = callback_query.from_user.id
+        if await is_user_verified(uid):
+            await callback_query.answer("You're already verified ✅", show_alert=True)
+        else:
+            await callback_query.answer()
+            await send_verify_prompt(client, _MsgShim(message, uid))
     elif data == "buy_premium":
         buttons = [
             [InlineKeyboardButton("💳 Pay Now (UPI)", url=PAY_URL)],
@@ -673,13 +943,15 @@ async def button_callbacks(client: Client, callback_query: CallbackQuery):
             reply_markup=InlineKeyboardMarkup(buttons)
         )
     elif data == "help_btn":
+        # Captions are limited to 1024 chars, so send a normal text message
+        # (limit 4096) instead of editing the photo caption.
         buttons = [[InlineKeyboardButton("⬅️ Back to Home", callback_data="start_btn")]]
-        await client.edit_message_caption(
+        await client.send_message(
             chat_id=message.chat.id,
-            message_id=message.id,
-            caption=script.HELP_TXT,
+            text=script.HELP_TXT,
             reply_markup=InlineKeyboardMarkup(buttons),
-            parse_mode=enums.ParseMode.HTML
+            parse_mode=enums.ParseMode.HTML,
+            disable_web_page_preview=True
         )
   
     elif data == "about_btn":

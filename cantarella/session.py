@@ -15,6 +15,9 @@ from pyrogram.errors import (
 from pyrogram import enums
 from config import API_ID, API_HASH
 from database.db import db
+from logger import LOGGER
+
+logger = LOGGER(__name__)
 
 LOGIN_STATE = {}
 cancel_keyboard = ReplyKeyboardMarkup(
@@ -149,7 +152,7 @@ async def login_handler(bot: Client, message: Message):
         return
    
     if step == "WAITING_PHONE":
-        phone_number = text.replace(" ", "")
+        phone_number = "".join(text.split())
        
         temp_client = Client(
             name=f"session_{user_id}",
@@ -181,8 +184,11 @@ async def login_handler(bot: Client, message: Message):
                 f"<b>📩 OTP Sent to your app! 📲</b>\n\n"
                 f"<i>Progress: {progress}</i>\n\n"
                 "Please open your Telegram app and copy the verification code.\n\n"
-                "<b>Send it like this:</b> <code>12 345</code> or <code>1 2 3 4 5 6</code>\n\n"
-                "<blockquote>Adding spaces helps prevent Telegram from deleting the message automatically. 💡</blockquote>",
+                "<b>⚠️ Send it WITH spaces between the digits:</b>\n"
+                "<code>1 2 3 4 5</code>\n\n"
+                "<blockquote>Telegram blocks a login if the code is sent as one number "
+                "(it treats it as a shared code). Spacing avoids that.\n\n"
+                "💡 Enter it within 2-3 minutes, and don't run /login again.</blockquote>",
                 parse_mode=enums.ParseMode.HTML
             )
            
@@ -215,12 +221,48 @@ async def login_handler(bot: Client, message: Message):
             del LOGIN_STATE[user_id]
    
     elif step == "WAITING_CODE":
-        phone_code = text.replace(" ", "")
-       
+        raw = text.strip()
+        # The code we sign in with must be plain digits, but Telegram blocks the
+        # login when the code is SENT as one solid number ("code was previously
+        # shared"). Requiring spaces avoids that flag.
+        phone_code = "".join(raw.split())
+
         temp_client = state["data"]["client"]
         phone_number = state["data"]["phone"]
         phone_hash = state["data"]["hash"]
-       
+
+        # Don't leave the code sitting in the chat
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        if len(raw.split()) < 2:
+            # Sent without spaces -> Telegram would block it. Get a fresh code
+            # and ask for it with spaces instead of burning this one.
+            resent = False
+            try:
+                new_code = await temp_client.send_code(phone_number)
+                state["data"]["hash"] = new_code.phone_code_hash
+                resent = True
+            except Exception as e:
+                logger.error(f"Could not resend code for {user_id}: {e}")
+
+            example = " ".join(phone_code) if phone_code.isdigit() else "1 2 3 4 5"
+            extra = (
+                "\n\n📩 A <b>fresh code</b> has been sent — use the new one."
+                if resent else ""
+            )
+            await message.reply(
+                "<b>⚠️ Please send the code WITH spaces between the digits.</b>\n\n"
+                "Telegram blocks a login when the code is sent as one number "
+                "(it treats it as a shared code).\n\n"
+                f"<b>Send it like this:</b> <code>{example}</code>"
+                f"{extra}",
+                parse_mode=enums.ParseMode.HTML
+            )
+            return
+
         status_msg = await message.reply(
             f"<b>🔍 Verifying code... 🔍</b>\n\n<i>Progress: {progress}</i>",
             parse_mode=enums.ParseMode.HTML
@@ -242,6 +284,29 @@ async def login_handler(bot: Client, message: Message):
             )
         except PhoneCodeExpired:
             animation_task.cancel()
+            logger.warning(f"PhoneCodeExpired for {user_id} - sending a fresh code")
+            # Telegram invalidates the old phone_code_hash (a second /login, a
+            # resend, a restart...). Instead of killing the session, request a
+            # fresh code and stay on the same step.
+            resent = False
+            try:
+                new_code = await temp_client.send_code(phone_number)
+                state["data"]["hash"] = new_code.phone_code_hash
+                state["step"] = "WAITING_CODE"
+                resent = True
+                await status_msg.edit(
+                    "<b>⏰ That code expired.</b>\n\n"
+                    f"<i>Progress: {progress}</i>\n\n"
+                    "📩 A <b>fresh code</b> has just been sent to your Telegram app.\n\n"
+                    "Please send the <b>new</b> code <b>with spaces</b>, like <code>1 2 3 4 5</code>.",
+                    parse_mode=enums.ParseMode.HTML
+                )
+            except Exception as e:
+                logger.error(f"Could not resend code for {user_id}: {e}")
+
+            if resent:
+                return
+
             try:
                 await status_msg.delete()
             except Exception:
@@ -252,8 +317,11 @@ async def login_handler(bot: Client, message: Message):
                 parse_mode=enums.ParseMode.HTML,
                 reply_markup=remove_keyboard
             )
-            await temp_client.disconnect()
-            del LOGIN_STATE[user_id]
+            try:
+                await temp_client.disconnect()
+            except Exception:
+                pass
+            LOGIN_STATE.pop(user_id, None)
         except SessionPasswordNeeded:
             animation_task.cancel()
            
@@ -262,8 +330,10 @@ async def login_handler(bot: Client, message: Message):
             await status_msg.edit(
                 f"<b>🔐 Two-Step Verification Detected 🔒</b>\n\n"
                 f"<i>Progress: {progress}</i>\n\n"
-                "Please enter your account <b>password</b>.\n\n"
-                "<i>Take your time — it's secure! 🛡️</i>",
+                "Please enter your <b>Two-Step Verification password</b>.\n\n"
+                "<blockquote>Send it exactly as it is — capitals and spaces matter. "
+                "It is your Telegram 2FA password, not your phone code.</blockquote>\n\n"
+                "<i>Your message is deleted right after for safety. 🛡️</i>",
                 parse_mode=enums.ParseMode.HTML
             )
         except Exception as e:
@@ -281,8 +351,15 @@ async def login_handler(bot: Client, message: Message):
             del LOGIN_STATE[user_id]
    
     elif step == "WAITING_PASSWORD":
+        # Passwords can contain spaces - never strip them. Delete the message so
+        # the password does not sit in the chat history.
         password = text
         temp_client = state["data"]["client"]
+
+        try:
+            await message.delete()
+        except Exception:
+            pass
        
         status_msg = await message.reply(
             f"<b>🔑 Checking password... 🔑</b>\n\n<i>Progress: {progress}</i>",
@@ -299,7 +376,9 @@ async def login_handler(bot: Client, message: Message):
             animation_task.cancel()
             await status_msg.edit(
                 "<b>❌ Incorrect password. 🔑</b>\n\n"
-                f"<i>Progress: {progress}</i>\n\nPlease try again.",
+                f"<i>Progress: {progress}</i>\n\n"
+                "Check it carefully — <b>capitals and spaces matter</b>. "
+                "Please send it again.",
                 parse_mode=enums.ParseMode.HTML
             )
         except Exception as e:
